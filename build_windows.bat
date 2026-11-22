@@ -3,6 +3,17 @@ setlocal
 cd /d "%~dp0"
 
 echo Building NEXUS for Windows...
+
+rem Find the compiler before spending time building the executable.
+set "ISCC="
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\find-inno-setup.ps1"`) do if not defined ISCC set "ISCC=%%I"
+if not defined ISCC (
+    echo ERROR: Could not find Inno Setup 6 or 7. If installed in a custom location,
+    echo set ISCC_PATH to the full path to ISCC.exe and rerun this script.
+    echo Example: set "ISCC_PATH=C:\My Tools\Inno Setup 6\ISCC.exe"
+    goto :fail
+)
+echo Using Inno Setup compiler: %ISCC%
 rem Prefer a compatible existing 64-bit Python, including versions other than 3.12.
 if exist ".venv-build\Scripts\python.exe" (
     ".venv-build\Scripts\python.exe" -c "import sys, struct; sys.exit(not (sys.version_info[:2] in [(3,10),(3,11),(3,12),(3,13)] and struct.calcsize('P') == 8))" >nul 2>&1
@@ -69,15 +80,6 @@ rem Use a directory bundle so the Qt and libtorrent runtime files travel with th
 if errorlevel 1 goto :fail
 if not exist "dist\NexusDownloadManager\NexusDownloadManager.exe" goto :fail
 
-rem ISCC can be on PATH or in the standard Inno Setup 6 installation directory.
-set "ISCC="
-for /f "delims=" %%I in ('where ISCC.exe 2^>nul') do if not defined ISCC set "ISCC=%%I"
-if not defined ISCC if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
-if not defined ISCC if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"
-if not defined ISCC (
-    echo ERROR: Inno Setup 6 compiler ISCC.exe was not found. Install Inno Setup 6 and run this script again.
-    goto :fail
-)
 "%ISCC%" "installer.iss"
 if errorlevel 1 goto :fail
 
