@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo Building NEXUS for Windows...
+echo Building Z's Download Manager for Windows...
 
 rem Find the compiler before spending time building the executable.
 set "ISCC="

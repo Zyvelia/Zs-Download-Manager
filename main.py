@@ -4,7 +4,7 @@ from neon.ui import MainWindow
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName('Nexus Download Manager')
+    app.setApplicationName("Z's Download Manager")
     window = MainWindow()
     window.show()
     return app.exec()

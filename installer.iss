@@ -1,4 +1,4 @@
-#define MyAppName "NEXUS Download Manager"
+#define MyAppName "Z's Download Manager"
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "Zyvelia"
 #define MyAppExeName "NexusDownloadManager.exe"

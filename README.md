@@ -1,4 +1,4 @@
-# NEXUS Download Manager
+# Z's Download Manager
 
 A desktop transfer manager built with Python, Qt and libtorrent. It supports HTTP(S), torrent files and magnet links in a unified dark neon dashboard.
 
@@ -17,9 +17,9 @@ python main.py
 
 If a libtorrent wheel is unavailable, install PySide6 alone and run the application for HTTP transfers. Torrent actions will explain that libtorrent is missing. Consult your platform's libtorrent packaging instructions to enable them.
 
-## Using NEXUS
+## Using Z's Download Manager
 
-Choose a destination in Settings, then paste an HTTP(S) URL or magnet URI and select **Add transfer**. Use **Open .torrent** for a torrent file. Dashboard shows aggregate rates, active transfers and completed transfers. Downloads and Torrents filter the same list. Each card shows status, progress, rates, transferred bytes, location and controls. Open launches a finished file or torrent directory with the system default application; Folder opens its containing folder. Torrent cancel and remove preserve downloaded data. HTTP cancellation removes its partial file; removing a paused/failed HTTP transfer leaves its partial file on disk.
+Choose a destination in Settings, then paste an HTTP(S) URL or magnet URI and select **Add transfer**. Use **Open .torrent** for a torrent file. Dashboard shows aggregate rates, active transfers and completed transfers. Downloads shows HTTP and torrent transfers together, with a distinct label for each type. Each card shows status, progress, rates, transferred bytes, location and controls. Open launches a finished file or torrent directory with the system default application; Folder opens its containing folder. Torrent cancel and remove preserve downloaded data. HTTP cancellation removes its partial file; removing a paused/failed HTTP transfer leaves its partial file on disk.
 
 ## How transfers work
 
