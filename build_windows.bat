@@ -40,9 +40,12 @@ if errorlevel 1 goto :fail
 echo.
 echo SUCCESS: executable folder: dist\NexusDownloadManager
 echo SUCCESS: installer: installer-output\NexusDownloadManager-Setup.exe
+if /i not "%~1"=="--no-pause" pause
 exit /b 0
 
 :fail
 echo.
 echo Build failed. Review the error above.
+echo If you need help, copy the error text or take a screenshot.
+if /i not "%~1"=="--no-pause" pause
 exit /b 1

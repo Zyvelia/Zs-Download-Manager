@@ -48,3 +48,5 @@ build_windows.bat
 ```
 
 The script creates a separate `.venv-build`, installs the runtime dependencies and PyInstaller, builds a windowed executable with its required runtime files, then invokes Inno Setup. The portable application folder is `dist\NexusDownloadManager` (keep its files together); the installer is `installer-output\NexusDownloadManager-Setup.exe`. The installer installs per user, adds a Start menu shortcut, and offers an optional desktop shortcut. Both output files are unsigned. This must be built on Windows; PyInstaller does not cross-compile from Linux or macOS. A missing compiler or failed packaging step makes the script return a nonzero exit code.
+
+The build window stays open after success or failure when launched by double-clicking. If it fails, read the error above the prompt. For unattended builds, use `build_windows.bat --no-pause`; it returns a nonzero exit code on failure.
