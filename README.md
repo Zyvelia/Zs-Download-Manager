@@ -52,3 +52,11 @@ The script creates a separate `.venv-build`, installs the runtime dependencies a
 The build window stays open after success or failure when launched by double-clicking. If it fails, read the error above the prompt. For unattended builds, use `build_windows.bat --no-pause`; it returns a nonzero exit code on failure.
 
 The build searches PATH, common system and per-user folders, and registered Inno Setup installations for `ISCC.exe`. If it still cannot find your installation, open Command Prompt and run `set "ISCC_PATH=C:\path\to\ISCC.exe"` before running `build_windows.bat` in the same window.
+
+## Transfer controls and verification
+
+Settings contains global download and upload limits in KiB/s (0 means unlimited). Each transfer has a **Limits** button for its own cap; direct downloads do not upload. When direct downloads and torrents are active together, a capped global download budget is split between them; torrent overhead and short measurement intervals can cause rate readings to fluctuate. The limits apply while the app is running; global settings persist, while per-transfer limits last for the current session.
+
+Use the search box and status/type filter above the transfer list to find downloads. Enable clipboard link detection in Settings to be offered copied HTTP(S) and magnet links. Notifications use the system tray, where supported, and clicking the most recent completion notification opens the file or folder. Failed transfer notifications bring the application forward. System notification availability and click handling depend on the desktop environment.
+
+For a direct download, paste an expected 64-character SHA-256 hash into the optional field before adding the URL. The worker hashes the completed partial file before making a final file. If it does not match, the file stays as `.part`, and a warning offers **Discard file**, **Keep anyway**, or **Decide later**. Use **Review hash** on the card to return to the decision. Keeping a mismatched file can be unsafe; verify the expected hash comes from a trusted source. Torrents use libtorrent's piece hashes and do not use this SHA-256 field. Checksums and pending decisions are not restored after the app closes; a quarantined `.part` remains on disk.

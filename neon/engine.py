@@ -1,5 +1,6 @@
 """Transfer engines. Workers never touch widgets; updates cross Qt signals."""
 import os
+import hashlib
 import re
 import threading
 import time
@@ -35,11 +36,39 @@ def unique_path(directory, name):
     raise OSError('Could not find an available filename')
 
 
+class RateLimiter:
+    """Shared reservation clock; callers wait outside the lock and can be canceled."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.rate = 0
+        self.next_time = time.monotonic()
+
+    def set_rate(self, rate):
+        with self.lock:
+            rate = max(0, int(rate))
+            if self.rate == rate: return
+            self.rate = rate
+            self.next_time = time.monotonic()
+
+    def wait(self, size, stop_event):
+        with self.lock:
+            if not self.rate:
+                return
+            now = time.monotonic()
+            deadline = max(now, self.next_time) + size / self.rate
+            self.next_time = deadline
+        stop_event.wait(max(0, deadline - time.monotonic()))
+
+
 class HttpWorker(QThread):
     changed = Signal(object)
-    def __init__(self, url, directory):
+    def __init__(self, url, directory, limiter=None, checksum=""):
         super().__init__()
         self.url, self.directory = url, directory
+        self.limiter = limiter or RateLimiter()
+        self.local_limiter = RateLimiter()
+        self.checksum = checksum.lower()
+        self.actual_checksum = ""
         self.stop_event = threading.Event()
         self.reason = 'Paused'
         self.path = None
@@ -55,7 +84,7 @@ class HttpWorker(QThread):
     def snapshot(self):
         return dict(name=self.name, kind=self.kind, status=self.status, done=self.offset,
                     total=self.total, down=self.speed, up=0, uploaded=0,
-                    path=str(self.path or Path(self.directory) / self.name), error=self.error)
+                    path=str(self.path or Path(self.directory) / self.name), error=self.error, actual_checksum=self.actual_checksum)
 
     def emit_update(self): self.changed.emit(self.snapshot())
 
@@ -97,8 +126,11 @@ class HttpWorker(QThread):
                 last_time, last_bytes = time.monotonic(), self.offset
                 with open(part, 'ab' if self.offset else 'wb') as out:
                     while not self.stop_event.is_set():
-                        chunk = response.read(128 * 1024)
+                        chunk = response.read(16 * 1024)
                         if not chunk: break
+                        self.limiter.wait(len(chunk), self.stop_event)
+                        self.local_limiter.wait(len(chunk), self.stop_event)
+                        if self.stop_event.is_set(): break
                         out.write(chunk)
                         self.offset += len(chunk)
                         now = time.monotonic()
@@ -115,17 +147,53 @@ class HttpWorker(QThread):
             elif self.total and self.offset != self.total:
                 raise IOError(f'Incomplete response ({self.offset} of {self.total} bytes)')
             else:
-                # Hard-link gives an atomic no-overwrite commit in the same directory.
-                try:
-                    os.link(part, self.path)
-                except FileExistsError:
-                    self.path = unique_path(self.directory, self.name)
-                    os.link(part, self.path)
-                part.unlink()
-                self.status = 'Completed'
+                if self.checksum:
+                    self.status = 'Verifying'
+                    self.emit_update()
+                    digest = hashlib.sha256()
+                    with open(part, 'rb') as source:
+                        for block in iter(lambda: source.read(1024 * 1024), b''):
+                            if self.stop_event.is_set(): break
+                            digest.update(block)
+                    if self.stop_event.is_set():
+                        self.status = self.reason
+                        if self.reason == 'Canceled': part.unlink(missing_ok=True)
+                    else:
+                        self.actual_checksum = digest.hexdigest()
+                        if self.actual_checksum != self.checksum:
+                            self.status = 'Checksum mismatch'
+                            self.error = 'SHA-256 mismatch; file is quarantined pending your decision.'
+                        else:
+                            self.commit_part()
+                else:
+                    self.commit_part()
         except Exception as exc:
             self.speed = 0
             self.status, self.error = 'Failed', str(exc)
+        self.emit_update()
+
+    def commit_part(self):
+        part = Path(str(self.path) + '.part')
+        try:
+            os.link(part, self.path)
+        except FileExistsError:
+            self.path = unique_path(self.directory, self.name)
+            os.link(part, self.path)
+        part.unlink()
+        self.status, self.error = 'Completed', ''
+
+    def resolve_mismatch(self, keep):
+        if self.status != 'Checksum mismatch': return
+        try:
+            if keep:
+                self.commit_part()
+                self.error = 'Kept despite SHA-256 mismatch.'
+            else:
+                Path(str(self.path) + '.part').unlink(missing_ok=True)
+                self.offset = 0
+                self.status, self.error = 'Canceled', 'Discarded after SHA-256 mismatch.'
+        except OSError as exc:
+            self.status, self.error = 'Checksum mismatch', str(exc)
         self.emit_update()
 
 
