@@ -41,7 +41,7 @@ Run the smoke test from the project directory with `python -m tests.smoke`. It u
 
 ## Build the Windows executable and installer
 
-On 64-bit Windows, install Python 3.12 (including the `py` launcher) and [Inno Setup 6](https://jrsoftware.org/isinfo.php). Internet access is needed to install Python packages. From a Command Prompt in the project folder, run:
+On 64-bit Windows, install [Inno Setup 6](https://jrsoftware.org/isinfo.php). The script finds an existing 64-bit Python 3.10–3.13, or downloads and installs Python 3.12 for the current user if none is found. Internet access is needed for Python (if missing) and Python packages. From a Command Prompt in the project folder, run:
 
 ```bat
 build_windows.bat
