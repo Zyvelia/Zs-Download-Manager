@@ -72,6 +72,7 @@ class HttpWorker(QThread):
         self.checksum = checksum.lower()
         self.hash_type = hash_type
         self.actual_checksum = ""
+        self.reverify_only = False
         self.stop_event = threading.Event()
         self.reason = 'Paused'
         self.path = None
@@ -100,6 +101,11 @@ class HttpWorker(QThread):
         self.status, self.error = 'Connecting', ''
         self.emit_update()
         try:
+            if self.reverify_only:
+                self.reverify_only = False
+                self.verify_part(Path(str(self.path) + '.part'))
+                self.emit_update()
+                return
             if self.path is None:
                 self.path = unique_path(self.directory, self.name)
             part = Path(str(self.path) + '.part')
@@ -151,29 +157,31 @@ class HttpWorker(QThread):
                 raise IOError(f'Incomplete response ({self.offset} of {self.total} bytes)')
             else:
                 if self.checksum:
-                    self.status = 'Verifying'
-                    self.emit_update()
-                    digest = hashlib.new(self.hash_type)
-                    with open(part, 'rb') as source:
-                        for block in iter(lambda: source.read(1024 * 1024), b''):
-                            if self.stop_event.is_set(): break
-                            digest.update(block)
-                    if self.stop_event.is_set():
-                        self.status = self.reason
-                        if self.reason == 'Canceled': part.unlink(missing_ok=True)
-                    else:
-                        self.actual_checksum = digest.hexdigest()
-                        if self.actual_checksum != self.checksum:
-                            self.status = 'Checksum mismatch'
-                            self.error = f'{self.hash_type.upper()} mismatch; file is quarantined pending your decision.'
-                        else:
-                            self.commit_part()
+                    self.verify_part(part)
                 else:
                     self.commit_part()
         except Exception as exc:
             self.speed = 0
             self.status, self.error = ('Waiting for network' if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, socket.timeout)) and not isinstance(exc, urllib.error.HTTPError) else 'Failed'), str(exc)
         self.emit_update()
+
+    def verify_part(self, part):
+        self.status = 'Verifying'; self.emit_update()
+        digest = hashlib.new(self.hash_type)
+        with open(part, 'rb') as source:
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                if self.stop_event.is_set(): break
+                digest.update(block)
+        if self.stop_event.is_set():
+            self.status = self.reason
+            if self.reason == 'Canceled': part.unlink(missing_ok=True)
+        else:
+            self.actual_checksum = digest.hexdigest()
+            if self.actual_checksum != self.checksum:
+                self.status = 'Checksum mismatch'
+                self.error = f'{self.hash_type.upper()} mismatch; file is quarantined pending your decision.'
+            else:
+                self.commit_part()
 
     def commit_part(self):
         part = Path(str(self.path) + '.part')

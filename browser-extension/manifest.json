@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Send to Z's Download Manager",
+  "version": "1.0.0",
+  "description": "Send selected links to your local download manager for confirmation.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlfz0VKNjp2c+726ympVbJ5SoKApgK7eq11dK+8ZaMsCzx/tuCEZGCfd+oQfvnSFNHgTIXx5jfOz1aGKIktRmOd5m0grneRBZDwXy1c4si88TgaXQ6VzIHsQoINU/EjxrWCCDs9okvhCFy8lkf1y/S3WiyWuSrP6LoPr0N3OiN8Y8jtdDbykE1r1KQ4e6P2aycDYS5gCVSbGLNeTO0pr1VDKrjZwtyV7ZSV2T9m52Fn9F4y0oj+lrwaG0IRH6ngqyIs/neWs01PqYkocWpJLdP/JDSijVQqOVW23MH2iisPZugJk2ncFJExKIJ5hPSbw8s0V9dS/uIWIcaxeB5MFu/QIDAQAB",
+  "permissions": [
+    "contextMenus",
+    "nativeMessaging",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Send a link to Z's",
+    "default_popup": "popup.html"
+  }
+}

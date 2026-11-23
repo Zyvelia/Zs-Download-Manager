@@ -23,7 +23,11 @@ with tempfile.TemporaryDirectory() as directory:
     strong.start(); assert strong.wait(10000); assert strong.status == 'Completed'; assert strong.path.read_bytes() == payload
     wrong = HttpWorker(url, str(dest), checksum='0' * 64)
     wrong.start(); assert wrong.wait(10000); assert wrong.status == 'Checksum mismatch'; assert not wrong.path.exists(); assert Path(str(wrong.path) + '.part').exists()
-    wrong.resolve_mismatch(False); assert wrong.status == 'Canceled'; assert not Path(str(wrong.path) + '.part').exists()
+    wrong.checksum = hashlib.sha512(payload).hexdigest(); wrong.hash_type = 'sha512'; wrong.reverify_only = True
+    wrong.start(); assert wrong.wait(10000); assert wrong.status == 'Completed'; assert wrong.path.read_bytes() == payload
+    discard = HttpWorker(url, str(dest), checksum='0' * 64)
+    discard.start(); assert discard.wait(10000); assert discard.status == 'Checksum mismatch'
+    discard.resolve_mismatch(False); assert discard.status == 'Canceled'; assert not Path(str(discard.path) + '.part').exists()
     keep = HttpWorker(url, str(dest), checksum='0' * 64)
     keep.start(); assert keep.wait(10000); keep.resolve_mismatch(True); assert keep.status == 'Completed'; assert keep.path.read_bytes() == payload
     rate = RateLimiter(); rate.set_rate(32768)

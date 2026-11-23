@@ -80,6 +80,12 @@ rem Use a directory bundle so the Qt and libtorrent runtime files travel with th
 if errorlevel 1 goto :fail
 if not exist "dist\NexusDownloadManager\NexusDownloadManager.exe" goto :fail
 
+rem Package a separate console native-messaging host and copy it beside the app.
+"%PYTHON%" -m PyInstaller --noconfirm --clean --console --onefile --name ZBrowserHost browser_host.py
+if errorlevel 1 goto :fail
+copy /y "dist\ZBrowserHost.exe" "dist\NexusDownloadManager\ZBrowserHost.exe" >nul
+if errorlevel 1 goto :fail
+
 "%ISCC%" "installer.iss"
 if errorlevel 1 goto :fail
 

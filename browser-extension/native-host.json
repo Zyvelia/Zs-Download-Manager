@@ -1,0 +1,7 @@
+{
+  "name": "com.zyvelia.z_download_manager",
+  "description": "Z's Download Manager browser link bridge",
+  "path": "ZBrowserHost.exe",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://jjmhgefmdphjpchjedibmohiondjpgab/"]
+}
