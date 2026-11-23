@@ -9,12 +9,14 @@ from urllib.parse import urlsplit
 from PySide6.QtCore import Qt, QSettings, QUrl, QTimer
 from PySide6.QtGui import QDesktopServices, QIcon, QPainter, QPen, QColor, QPainterPath
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QCheckBox, QDialog, QDialogButtonBox, QSystemTrayIcon, QMenu, QInputDialog,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QCheckBox, QDialog, QDialogButtonBox, QSystemTrayIcon, QMenu, QInputDialog, QPlainTextEdit, QProgressDialog,
     QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 from .engine import HttpWorker, TorrentEngine, RateLimiter, readable
 from .history import History
 from .extract import ExtractWorker
 from .taskbar import TaskbarProgress
+from .workflows import prepare_batch, validate_transfer_url, retry_delay, validate_profile
+from .diagnostics import create_logger
 
 ROOT = Path(__file__).resolve().parent.parent
 STYLE = '''
@@ -142,7 +144,7 @@ class TransferCard(QFrame):
             self.obj.resume() if self.data['status'] == 'Paused' else self.obj.pause()
         elif self.obj.isRunning(): self.obj.halt('Paused'); self.pause.setEnabled(False)
         elif self.data['status'] in ('Waiting for network', 'Queued'): self.obj.status = 'Paused'; self.obj.emit_update()
-        else: self.obj.status = 'Queued'; self.obj.emit_update(); self.owner.pump_queue()
+        else: self.retry_attempts = 0; self.next_retry = 0; self.obj.status = 'Queued'; self.obj.emit_update(); self.owner.pump_queue()
 
     def cancel_transfer(self):
         if self.data['kind'] == 'TORRENT':
@@ -253,6 +255,7 @@ class MainWindow(QMainWindow):
         super().__init__(); self.setWindowTitle("Z's Download Manager"); self.resize(1200, 820); self.setMinimumSize(850, 600)
         self.setWindowIcon(QIcon(str(ROOT / 'assets/logo.svg'))); self.setStyleSheet(STYLE)
         self.taskbar = TaskbarProgress(self)
+        self.logger = create_logger(); self.bulk_loading = False
         self.settings = QSettings('Nexus', 'DownloadManager'); self.history = History(); self.restoring = False; self.history_readonly = False; self.cards = []; self.nav_buttons = {}; self.section = 'Dashboard'
         self.directory = self.settings.value('directory', str(Path.home() / 'Downloads'))
         self.torrents = TorrentEngine(); self.torrents.changed.connect(self.torrent_update)
@@ -284,7 +287,7 @@ class MainWindow(QMainWindow):
         self.graph_timer = QTimer(self); self.graph_timer.timeout.connect(self.sample_speeds); self.graph_timer.start(1000)
         self.add_panel = QFrame(); self.add_panel.setObjectName('panel'); al = QVBoxLayout(self.add_panel); al.setContentsMargins(18,16,18,17)
         row = QHBoxLayout(); row.addWidget(label('Start a transfer', 'filename')); row.addStretch(); row.addWidget(label('HTTP / HTTPS  ·  MAGNET  ·  TORRENT', 'eyebrow')); al.addLayout(row)
-        row = QHBoxLayout(); self.url = QLineEdit(); self.url.setPlaceholderText('Paste a download URL or magnet link…'); self.url.returnPressed.connect(self.add_url); row.addWidget(self.url,1); row.addWidget(button('Add transfer  ↗',self.add_url,True)); row.addWidget(button('Open .torrent',self.add_torrent_file)); al.addLayout(row)
+        row = QHBoxLayout(); self.url = QLineEdit(); self.url.setPlaceholderText('Paste a download URL or magnet link…'); self.url.returnPressed.connect(self.add_url); row.addWidget(self.url,1); row.addWidget(button('Add transfer  ↗',self.add_url,True)); row.addWidget(button('Open .torrent',self.add_torrent_file)); row.addWidget(button('Batch links',self.batch_links)); al.addLayout(row)
         hash_row = QHBoxLayout(); self.hash_type = QComboBox(); self.hash_type.addItems(['SHA-256','SHA-512']); hash_row.addWidget(self.hash_type)
         self.hash_input = QLineEdit(); self.hash_input.setPlaceholderText('Optional expected checksum for direct downloads'); hash_row.addWidget(self.hash_input,1); al.addLayout(hash_row)
         self.destination = label('', 'muted'); al.addWidget(self.destination); self.content_layout.addWidget(self.add_panel)
@@ -301,6 +304,10 @@ class MainWindow(QMainWindow):
         self.global_down = QSpinBox(); self.global_down.setRange(0,1000000); self.global_down.setPrefix('Download: '); self.global_down.setSuffix(' KiB/s'); self.global_down.setValue(int(self.settings.value('down_limit',0))); se.addWidget(self.global_down)
         self.global_up = QSpinBox(); self.global_up.setRange(0,1000000); self.global_up.setPrefix('Upload: '); self.global_up.setSuffix(' KiB/s'); self.global_up.setValue(int(self.settings.value('up_limit',0))); se.addWidget(self.global_up)
         self.global_down.valueChanged.connect(self.update_limits); self.global_up.valueChanged.connect(self.update_limits)
+        se.addWidget(label('Queue and retries', 'filename'))
+        self.queue_limit = QSpinBox(); self.queue_limit.setRange(1, 20); self.queue_limit.setPrefix('HTTP slots: '); self.queue_limit.setValue(int(self.settings.value('queue_limit', 3))); self.queue_limit.valueChanged.connect(self.queue_settings_changed); se.addWidget(self.queue_limit)
+        self.retry_limit = QSpinBox(); self.retry_limit.setRange(0, 100); self.retry_limit.setPrefix('Retry limit (0 = unlimited): '); self.retry_limit.setValue(int(self.settings.value('retry_limit', 0))); self.retry_limit.valueChanged.connect(self.queue_settings_changed); se.addWidget(self.retry_limit)
+        se.addWidget(button('View activity log', self.show_activity))
         se.addWidget(label('Dashboard panels', 'filename'))
         for idx, title in enumerate(['DOWNLOAD SPEED','UPLOAD SPEED','ACTIVE TRANSFERS','COMPLETED']):
             check = QCheckBox(title.title()); check.setChecked(self.settings.value('metric_' + title, True, type=bool)); check.toggled.connect(lambda enabled, i=idx, name=title: self.set_metric_visible(i, name, enabled)); se.addWidget(check)
@@ -309,6 +316,7 @@ class MainWindow(QMainWindow):
         self.compact = QCheckBox('Compact transfer cards'); self.compact.setChecked(self.settings.value('compact', False, type=bool)); self.compact.toggled.connect(self.set_compact); se.addWidget(self.compact)
         self.extract_enabled = QCheckBox('Automatically extract completed ZIP archives'); self.extract_enabled.setChecked(self.settings.value('extract_zip', False, type=bool)); self.extract_enabled.toggled.connect(lambda v: self.settings.setValue('extract_zip', v)); se.addWidget(self.extract_enabled)
         self.organize = QCheckBox('Organize direct downloads into folders by file type'); self.organize.setChecked(self.settings.value('organize', False, type=bool)); self.organize.toggled.connect(lambda v: self.settings.setValue('organize', v)); se.addWidget(self.organize)
+        profiles = QHBoxLayout(); profiles.addWidget(button('Save profile', self.save_profile)); profiles.addWidget(button('Apply profile', self.apply_profile)); se.addLayout(profiles)
         options = QHBoxLayout(); options.addWidget(button('Export settings', self.export_settings)); options.addWidget(button('Import settings', self.import_settings)); se.addLayout(options)
         se.addWidget(label('Lifetime transfer statistics', 'filename'))
         self.stats_label = label('', 'muted'); self.stats_label.setWordWrap(True); se.addWidget(self.stats_label)
@@ -316,7 +324,7 @@ class MainWindow(QMainWindow):
         se.addWidget(label('Notifications appear when your system tray is available. Click a completed notification to open the file.', 'muted')); se.addStretch(); self.settings_scroll = QScrollArea(); self.settings_scroll.setWidgetResizable(True); self.settings_scroll.setWidget(self.settings_panel); self.content_layout.addWidget(self.settings_scroll,1)
         self.navigate('Dashboard'); self.update_directory(); self.refresh_metrics(); self.refresh_statistics(); self.update_limits(); self.restore_history()
         self.save_timer = QTimer(self); self.save_timer.timeout.connect(self.save_history); self.save_timer.start(5000)
-        self.retry_timer = QTimer(self); self.retry_timer.timeout.connect(self.retry_network); self.retry_timer.start(15000)
+        self.retry_timer = QTimer(self); self.retry_timer.timeout.connect(self.retry_network); self.retry_timer.start(5000)
 
     def navigate(self, section):
         self.section = section; self.heading.setText(section)
@@ -381,14 +389,48 @@ class MainWindow(QMainWindow):
             folder.mkdir(parents=True, exist_ok=True)
         return str(folder)
 
+    def get_profiles(self):
+        try:
+            profiles = json.loads(self.settings.value('profiles_json', '{}'))
+            if not isinstance(profiles, dict): raise ValueError('Invalid profiles data')
+            return profiles
+        except (ValueError, TypeError) as exc:
+            raise ValueError('Saved profiles could not be read; existing data was not changed.') from exc
+
+    def save_profile(self):
+        name, ok = QInputDialog.getText(self, 'Save profile', 'Profile name:')
+        name = name.strip()
+        if not ok or not name: return
+        if len(name) > 80: QMessageBox.warning(self, 'Save profile', 'Use a name of 80 characters or fewer.'); return
+        try:
+            profiles = self.get_profiles()
+            if name not in profiles and len(profiles) >= 20: raise ValueError('Maximum of 20 profiles reached.')
+            if name in profiles and QMessageBox.question(self, 'Replace profile', f'Replace profile {name}?') != QMessageBox.StandardButton.Yes: return
+            profiles[name] = validate_profile(dict(directory=self.directory, down_limit=self.global_down.value(), up_limit=self.global_up.value(), queue_limit=self.queue_limit.value(), retry_limit=self.retry_limit.value(), organize=self.organize.isChecked(), extract_zip=self.extract_enabled.isChecked()))
+            self.settings.setValue('profiles_json', json.dumps(profiles)); self.logger.info('profile saved')
+        except ValueError as exc: QMessageBox.warning(self, 'Save profile', str(exc))
+
+    def apply_profile(self):
+        try: profiles = self.get_profiles()
+        except ValueError as exc: QMessageBox.warning(self, 'Apply profile', str(exc)); return
+        if not profiles: QMessageBox.information(self, 'Apply profile', 'Save a profile first.'); return
+        name, ok = QInputDialog.getItem(self, 'Apply profile', 'Choose a saved profile:', sorted(profiles), 0, False)
+        if not ok: return
+        try: profile = validate_profile(profiles[name])
+        except ValueError as exc: QMessageBox.warning(self, 'Apply profile', str(exc)); return
+        self.directory = profile['directory']; self.settings.setValue('directory', self.directory); self.update_directory()
+        self.global_down.setValue(profile['down_limit']); self.global_up.setValue(profile['up_limit'])
+        self.queue_limit.setValue(profile['queue_limit']); self.retry_limit.setValue(profile['retry_limit'])
+        self.organize.setChecked(profile['organize']); self.extract_enabled.setChecked(profile['extract_zip']); self.logger.info('profile applied')
+
     def export_settings(self):
         path, _ = QFileDialog.getSaveFileName(self, 'Export settings', 'z-settings.json', 'JSON (*.json)')
         if not path: return
         try:
-            values = {'directory': self.directory, 'down_limit': self.global_down.value(), 'up_limit': self.global_up.value(), 'clipboard': self.clipboard_enabled.isChecked(), 'organize': self.organize.isChecked(), 'extract_zip': self.extract_enabled.isChecked(), 'compact': self.compact.isChecked(), 'reduced_motion': self.reduced_motion.isChecked(), 'show_graph': self.graph_enabled.isChecked()}
+            values = {'directory': self.directory, 'down_limit': self.global_down.value(), 'up_limit': self.global_up.value(), 'clipboard': self.clipboard_enabled.isChecked(), 'organize': self.organize.isChecked(), 'extract_zip': self.extract_enabled.isChecked(), 'compact': self.compact.isChecked(), 'reduced_motion': self.reduced_motion.isChecked(), 'show_graph': self.graph_enabled.isChecked(), 'queue_limit': self.queue_limit.value(), 'retry_limit': self.retry_limit.value(), 'profiles': self.get_profiles()}
             for i, name in enumerate(('DOWNLOAD SPEED','UPLOAD SPEED','ACTIVE TRANSFERS','COMPLETED')): values['metric_' + name] = self.settings.value('metric_' + name, True, type=bool)
             Path(path).write_text(json.dumps(values, indent=2), encoding='utf-8')
-        except OSError as exc: QMessageBox.warning(self, 'Export failed', str(exc))
+        except (OSError, ValueError) as exc: QMessageBox.warning(self, 'Export failed', str(exc))
 
     def import_settings(self):
         path, _ = QFileDialog.getOpenFileName(self, 'Import settings', '', 'JSON (*.json)')
@@ -397,11 +439,21 @@ class MainWindow(QMainWindow):
             values = json.loads(Path(path).read_text(encoding='utf-8'))
             down = int(values.get('down_limit', 0)); up = int(values.get('up_limit', 0))
             if not (0 <= down <= 1000000 and 0 <= up <= 1000000): raise ValueError('Invalid speed limit')
+            queue_limit = int(values.get('queue_limit', self.queue_limit.value())); retry_limit = int(values.get('retry_limit', self.retry_limit.value()))
+            if not (1 <= queue_limit <= 20 and 0 <= retry_limit <= 100): raise ValueError('Invalid queue or retry limit')
+            profiles = values.get('profiles')
+            if profiles is not None:
+                if not isinstance(profiles, dict) or len(profiles) > 20: raise ValueError('Invalid profiles')
+                for key, profile in profiles.items():
+                    if not isinstance(key, str) or not key or len(key) > 80: raise ValueError('Invalid profile name')
+                    validate_profile(profile)
             directory = values.get('directory', self.directory)
             if not isinstance(directory, str) or not directory: raise ValueError('Invalid directory')
             def checked(value): return value if isinstance(value, bool) else str(value).lower() in ('true','1')
             self.directory = directory; self.settings.setValue('directory', directory); self.update_directory()
             self.global_down.setValue(down); self.global_up.setValue(up)
+            self.queue_limit.setValue(queue_limit); self.retry_limit.setValue(retry_limit)
+            if profiles is not None: self.settings.setValue('profiles_json', json.dumps(profiles))
             self.clipboard_enabled.setChecked(checked(values.get('clipboard', False))); self.organize.setChecked(checked(values.get('organize', False)))
             self.extract_enabled.setChecked(checked(values.get('extract_zip', False))); self.reduced_motion.setChecked(checked(values.get('reduced_motion', False))); self.compact.setChecked(checked(values.get('compact', False))); self.graph_enabled.setChecked(checked(values.get('show_graph', True)))
             for name in ('DOWNLOAD SPEED','UPLOAD SPEED','ACTIVE TRANSFERS','COMPLETED'):
@@ -420,7 +472,7 @@ class MainWindow(QMainWindow):
 
     def resume_all(self):
         for c in self.cards:
-            if c.data['kind'] == 'HTTP' and c.data['status'] in ('Paused','Waiting for network') and not c.obj.isRunning(): c.obj.status = 'Queued'; c.obj.emit_update()
+            if c.data['kind'] == 'HTTP' and c.data['status'] in ('Paused','Waiting for network') and not c.obj.isRunning(): c.retry_attempts = 0; c.next_retry = 0; c.obj.status = 'Queued'; c.obj.emit_update()
             elif c.data['kind'] == 'TORRENT' and c.data['status'] == 'Paused' and c.obj in self.torrents.handles: c.obj.resume()
         self.pump_queue()
 
@@ -432,10 +484,76 @@ class MainWindow(QMainWindow):
     def ensure_directory(self):
         p=Path(self.directory); p.mkdir(parents=True,exist_ok=True)
         if not p.is_dir() or not os.access(p,os.W_OK): raise ValueError('Download destination is not writable.')
+    def queue_settings_changed(self, *args):
+        if not hasattr(self, 'retry_limit'): return
+        self.settings.setValue('queue_limit', self.queue_limit.value()); self.settings.setValue('retry_limit', self.retry_limit.value())
+        self.pump_queue()
+
+    def show_activity(self):
+        dialog = QDialog(self); dialog.setWindowTitle('Activity log'); dialog.resize(700, 420)
+        layout = QVBoxLayout(dialog); layout.addWidget(label('Recent state transitions. Links and filenames are excluded.', 'muted'))
+        view = QPlainTextEdit(); view.setReadOnly(True)
+        try:
+            log_file = Path(self.history.path.parent) / 'activity.log'
+            with log_file.open('rb') as f:
+                f.seek(0, os.SEEK_END); f.seek(max(0, f.tell() - 100000)); content = f.read().decode('utf-8', 'replace')
+            view.setPlainText(content)
+        except OSError: view.setPlainText('No activity log is available.')
+        layout.addWidget(view); layout.addWidget(button('Close', dialog.accept)); dialog.exec()
+
+    def batch_links(self):
+        if getattr(self, 'batch_active', False): return
+        method, ok = QInputDialog.getItem(self, 'Batch links', 'Input source:', ['Paste links', 'Import UTF-8 text file'], 0, False)
+        if not ok: return
+        if method == 'Paste links':
+            text, ok = QInputDialog.getMultiLineText(self, 'Batch links', 'One HTTP(S) or magnet link per line:')
+            if not ok: return
+        else:
+            path, _ = QFileDialog.getOpenFileName(self, 'Import links', '', 'Text files (*.txt);;All files (*)')
+            if not path: return
+            try:
+                if Path(path).stat().st_size > 1024 * 1024: raise ValueError('Text file exceeds 1 MiB')
+                text = Path(path).read_text(encoding='utf-8-sig')
+            except (OSError, UnicodeError, ValueError) as exc: QMessageBox.warning(self, 'Import failed', str(exc)); return
+        try:
+            existing = [c.obj.url for c in self.cards if c.data['kind'] == 'HTTP']
+            existing += [info['source'] for info in self.torrents.sources.values() if info['source'].startswith('magnet:')]
+            accepted, rejected = prepare_batch(text, existing)
+            self.ensure_directory()
+        except (OSError, ValueError) as exc: QMessageBox.warning(self, 'Batch preview', str(exc)); return
+        details = '\n'.join(f'Line {n}: {reason}' for n, reason in rejected[:12])
+        if len(rejected) > 12: details += f'\n… and {len(rejected)-12} more.'
+        if not accepted: QMessageBox.information(self, 'Batch preview', 'No new valid links.\n' + details); return
+        answer = QMessageBox.question(self, 'Batch preview', f'Add {len(accepted)} links? {len(rejected)} invalid or duplicate lines will be skipped.\n{details}', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes: return
+        self.batch_active = True; self.bulk_loading = True
+        self.batch_dialog = QProgressDialog('Adding transfers…', 'Stop adding', 0, len(accepted), self)
+        self.batch_dialog.setWindowModality(Qt.WindowModality.WindowModal); self.batch_dialog.setMinimumDuration(0); self.batch_dialog.show()
+        state = {'index': 0, 'failed': 0}
+        def step():
+            if not self.batch_active: return
+            if self.batch_dialog.wasCanceled() or state['index'] >= len(accepted):
+                self.batch_active = False; self.bulk_loading = False; self.batch_dialog.close()
+                self.filter_cards(); self.sort_cards(); self.refresh_metrics(); self.update_limits(); self.pump_queue(); self.save_history()
+                if state['failed']: QMessageBox.warning(self, 'Batch complete', f"{state['failed']} transfers could not be added. Other transfers were kept.")
+                return
+            for _ in range(12):
+                if state['index'] >= len(accepted): break
+                url = accepted[state['index']]; state['index'] += 1
+                try:
+                    if url.startswith('magnet:?'): self.add_torrent(url)
+                    else:
+                        worker = HttpWorker(url, self.destination_for(url), self.http_limiter)
+                        card = TransferCard(self, worker, worker.snapshot()); self.bind_worker(card); self.add_card(card)
+                except (OSError, ValueError, RuntimeError): state['failed'] += 1
+            self.batch_dialog.setValue(state['index']); QTimer.singleShot(0, step)
+        QTimer.singleShot(0, step)
+
     def add_url(self):
         url = self.url.text().strip()
         try:
             self.ensure_directory()
+            url = validate_transfer_url(url)
             checksum = self.hash_input.text().strip()
             algorithm = self.hash_type.currentText().lower().replace('-', '')
             digits = 64 if algorithm == 'sha256' else 128
@@ -444,8 +562,6 @@ class MainWindow(QMainWindow):
                 if checksum: raise ValueError('Checksums are available for direct downloads only. Torrents use their own piece verification.')
                 self.add_torrent(url)
             else:
-                parsed=urlsplit(url)
-                if parsed.scheme not in ('http','https') or not parsed.hostname: raise ValueError('Enter a valid HTTP, HTTPS, or magnet link.')
                 directory = self.destination_for(url)
                 worker=HttpWorker(url,directory,self.http_limiter,checksum,algorithm); card=TransferCard(self,worker,worker.snapshot()); self.bind_worker(card); self.add_card(card); self.pump_queue(); self.save_history()
             self.url.clear(); self.hash_input.clear()
@@ -465,18 +581,22 @@ class MainWindow(QMainWindow):
         for c in self.cards:
             if c.data['kind']=='TORRENT' and c.obj==h: c.update_data(data); self.transfer_changed(c, data); break
         self.refresh_metrics()
-    def add_card(self,c): c.created = getattr(c, 'created', time.time()); self.stats_baseline[c] = (c.data['done'], c.data['uploaded']); self.cards.append(c); c.detail.setVisible(not self.compact.isChecked()); c.stats.setVisible(not self.compact.isChecked()); self.list_layout.insertWidget(self.list_layout.count()-1,c); self.filter_cards(); self.sort_cards(); self.refresh_metrics(); self.update_limits()
+    def add_card(self,c):
+        c.created = getattr(c, 'created', time.time()); self.stats_baseline[c] = (c.data['done'], c.data['uploaded']); self.cards.append(c)
+        c.detail.setVisible(not self.compact.isChecked()); c.stats.setVisible(not self.compact.isChecked()); self.list_layout.insertWidget(self.list_layout.count()-1,c)
+        if not self.bulk_loading: self.filter_cards(); self.sort_cards(); self.refresh_metrics(); self.update_limits()
     def remove_card(self,c): self.stats_baseline.pop(c, None); self.last_status.pop(c, None); self.cards.remove(c); self.list_layout.removeWidget(c); c.deleteLater(); self.filter_cards(); self.refresh_metrics(); self.update_limits(); self.save_history()
     def refresh_metrics(self,*args):
         ds=[c.data for c in self.cards]; values=[readable(sum(x['down'] for x in ds))+'/s',readable(sum(x['up'] for x in ds))+'/s',str(sum(x['status'] in ('Downloading','Connecting','Fetching metadata','Seeding') for x in ds)),str(sum(x['status'] in ('Completed','Seeding') for x in ds))]
         for w,v in zip(self.metric_values,values): w.setText(v)
         self.taskbar.update(ds)
     def pump_queue(self):
-        # Direct downloads have three slots; higher priority queued items start first.
+        # Direct transfers are bounded; higher-priority waiting items start first.
         active = sum(c.obj.isRunning() for c in self.cards if c.data['kind'] == 'HTTP')
         queued = [c for c in self.cards if c.data['kind'] == 'HTTP' and c.obj.status == 'Queued' and not c.obj.isRunning()]
         queued.sort(key=lambda c: (-getattr(c, 'priority', 1), getattr(c, 'created', 0)))
-        for card in queued[:max(0, 3-active)]: card.obj.start()
+        limit = self.queue_limit.value() if hasattr(self, 'queue_limit') else 3
+        for card in queued[:max(0, limit-active)]: card.obj.start()
 
     def bind_worker(self, card):
         card.obj.changed.connect(card.update_data)
@@ -487,7 +607,7 @@ class MainWindow(QMainWindow):
         records = []
         for card in self.cards:
             data = dict(card.data); obj = card.obj
-            data.update(created=getattr(card, 'created', time.time()), priority=getattr(card, 'priority', 1), counted=getattr(card, 'counted', False))
+            data.update(created=getattr(card, 'created', time.time()), priority=getattr(card, 'priority', 1), counted=getattr(card, 'counted', False), retry_attempts=getattr(card, 'retry_attempts', 0), next_retry=getattr(card, 'next_retry', 0))
             if data['kind'] == 'HTTP':
                 data.update(url=obj.url, directory=obj.directory, validator=obj.validator, checksum=obj.checksum, hash_type=obj.hash_type, actual_checksum=obj.actual_checksum, local_limit=obj.local_limiter.rate, worker_path=str(obj.path) if obj.path else '')
             else:
@@ -498,7 +618,7 @@ class MainWindow(QMainWindow):
         return records
 
     def save_history(self):
-        if self.restoring or self.history_readonly: return
+        if self.restoring or self.history_readonly or self.bulk_loading: return
         for key, value in self.statistics.items(): self.settings.setValue('stats_' + key, value)
         try: self.history.save(self.history_records())
         except OSError as exc:
@@ -506,11 +626,16 @@ class MainWindow(QMainWindow):
                 self._history_error_shown = True; QMessageBox.warning(self, 'History could not be saved', str(exc))
 
     def restore_history(self):
-        self.restoring = True; restart = []; errors = []
+        self.restoring = True; self.bulk_loading = True; restart = []; errors = []
         try:
             try: records = self.history.load()
             except (OSError, ValueError) as exc:
-                self.history_readonly = True; QMessageBox.warning(self, 'History could not be loaded', str(exc)); return
+                try: backup = self.history.load_backup()
+                except (OSError, ValueError):
+                    self.history_readonly = True; QMessageBox.warning(self, 'History could not be loaded', str(exc)); return
+                if QMessageBox.question(self, 'History recovery', 'History is unreadable. Restore the previous backup? Newer changes may be missing.', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                    self.history_readonly = True; return
+                records = backup; self.logger.warning('history restored from backup')
             for data in records:
                 try:
                     if data['kind'] == 'HTTP':
@@ -536,18 +661,20 @@ class MainWindow(QMainWindow):
                     if data['kind'] == 'TORRENT' and data['status'] != 'Canceled':
                         if card.priority == 2: obj.queue_position_top()
                         elif card.priority == 0: obj.queue_position_bottom()
-                    card.counted = data.get('counted', data.get('status') in ('Completed','Seeding')); self.add_card(card)
+                    card.counted = data.get('counted', data.get('status') in ('Completed','Seeding')); card.retry_attempts = data.get('retry_attempts', 0); card.next_retry = data.get('next_retry', 0); self.add_card(card)
                 except (ValueError, OSError, KeyError, RuntimeError) as exc: errors.append(str(exc))
             self.pump_queue()
             self.torrents.poll()
             if errors:
                 self.history_readonly = True
                 QMessageBox.warning(self, 'Some transfers could not be restored', 'History will not be overwritten.\n' + '\n'.join(errors[:5]))
-        finally: self.restoring = False
+        finally:
+            self.restoring = False; self.bulk_loading = False
+            self.filter_cards(); self.sort_cards(); self.refresh_metrics(); self.update_limits()
 
     def retry_network(self):
         for card in self.cards:
-            if card.data['kind'] == 'HTTP' and card.data['status'] == 'Waiting for network' and not card.obj.isRunning(): card.obj.status = 'Queued'; card.obj.emit_update()
+            if card.data['kind'] == 'HTTP' and card.data['status'] == 'Waiting for network' and not card.obj.isRunning() and time.time() >= getattr(card, 'next_retry', 0): card.obj.status = 'Queued'; card.obj.emit_update()
         self.pump_queue()
 
     def refresh_statistics(self):
@@ -597,6 +724,18 @@ class MainWindow(QMainWindow):
             card.counted = True; self.statistics['completed'] += 1
         self.refresh_statistics()
         if old != new:
+            if new == 'Waiting for network' and data['kind'] == 'HTTP':
+                card.retry_attempts = getattr(card, 'retry_attempts', 0) + 1
+                if self.retry_limit.value() and card.retry_attempts > self.retry_limit.value():
+                    card.obj.status = new = 'Failed'; card.obj.error = 'Retry limit reached. ' + card.obj.error
+                    data = card.obj.snapshot(); card.update_data(data); self.last_status[card] = new
+                else:
+                    delay = retry_delay(card.retry_attempts); card.next_retry = time.time() + delay
+                    data = dict(data); data['error'] = f"{data.get('error','')}  ·  Retry {card.retry_attempts} in about {delay}s"
+                    card.update_data(data)
+            elif new in ('Completed', 'Seeding'):
+                card.retry_attempts = 0; card.next_retry = 0
+            self.logger.info('transfer kind=%s state=%s', data['kind'], new)
             self.filter_cards(); self.update_limits()
             if new == 'Checksum mismatch': QTimer.singleShot(0, card.review_hash)
             if new == 'Completed' and data['kind'] == 'HTTP' and not data.get('error') and self.extract_enabled.isChecked() and data['path'].lower().endswith('.zip'):
@@ -632,6 +771,7 @@ class MainWindow(QMainWindow):
             self.url.setText(text); self.navigate('Downloads'); self.showNormal(); self.raise_(); self.activateWindow()
 
     def closeEvent(self,event):
+        self.batch_active = False; self.bulk_loading = False
         workers=[c.obj for c in self.cards if c.data['kind']=='HTTP' and c.obj.isRunning()]
         resume_on_start = [w for w in workers if not w.stop_event.is_set()]
         for w in workers: w.halt('Paused')

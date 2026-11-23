@@ -11,4 +11,8 @@ for name,priority in [('low',0),('normal',1),('high',2),('other',1)]:
     obj=Worker(name,started); cards.append(SimpleNamespace(data={'kind':'HTTP'},obj=obj,priority=priority,created=len(cards)))
 MainWindow.pump_queue(SimpleNamespace(cards=cards))
 assert started == ['high','normal','other'], started
-print('Priority queue starts highest-priority waiting transfers first: PASS')
+started.clear()
+for c in cards: c.obj.running=False
+MainWindow.pump_queue(SimpleNamespace(cards=cards, queue_limit=SimpleNamespace(value=lambda: 2)))
+assert started == ['high','normal'], started
+print('Priority queue and configurable concurrency: PASS')

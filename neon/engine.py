@@ -96,18 +96,31 @@ class HttpWorker(QThread):
         self.reason = reason
         self.stop_event.set()
 
-    def run(self):
+    def start(self, priority=QThread.Priority.InheritPriority):
+        if self.isRunning(): return
         self.stop_event.clear()
+        super().start(priority)
+
+    def run(self):
         self.status, self.error = 'Connecting', ''
         self.emit_update()
         try:
+            if self.stop_event.is_set(): raise InterruptedError('Transfer stopped')
             if self.reverify_only:
                 self.reverify_only = False
                 self.verify_part(Path(str(self.path) + '.part'))
                 self.emit_update()
                 return
             if self.path is None:
-                self.path = unique_path(self.directory, self.name)
+                # Atomically reserve the partial file before any network operation.
+                while True:
+                    candidate = unique_path(self.directory, self.name)
+                    part = Path(str(candidate) + '.part')
+                    try:
+                        fd = os.open(part, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                        os.close(fd); self.path = candidate; break
+                    except FileExistsError:
+                        continue
             part = Path(str(self.path) + '.part')
             self.offset = part.stat().st_size if part.exists() else 0
             headers = {'User-Agent': 'NeonDownloadManager/1.0', 'Accept-Encoding': 'identity'}
@@ -116,7 +129,26 @@ class HttpWorker(QThread):
             if self.offset:
                 headers['Range'] = f'bytes={self.offset}-'
                 headers['If-Range'] = self.validator
-            with urllib.request.urlopen(urllib.request.Request(self.url, headers=headers), timeout=15) as response:
+            try:
+                response = urllib.request.urlopen(urllib.request.Request(self.url, headers=headers), timeout=15)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 416 or not self.offset: raise
+                content_range = exc.headers.get('Content-Range', '')
+                match = re.fullmatch(r'bytes \*/(\d+)', content_range)
+                validator = exc.headers.get('ETag') or exc.headers.get('Last-Modified')
+                if match and int(match.group(1)) == self.offset and validator == self.validator:
+                    self.total = self.offset
+                    exc.close()
+                    if self.stop_event.is_set(): raise InterruptedError('Transfer stopped')
+                    if self.checksum: self.verify_part(part)
+                    else: self.commit_part()
+                    self.emit_update()
+                    return
+                exc.close()
+                # Without proof that the partial is current, safely restart from byte zero.
+                headers.pop('Range', None); headers.pop('If-Range', None); self.offset = 0
+                response = urllib.request.urlopen(urllib.request.Request(self.url, headers=headers), timeout=15)
+            with response:
                 if self.offset and response.status != 206:
                     # The server ignored Range; restart the partial file from zero.
                     self.offset = 0
@@ -162,7 +194,15 @@ class HttpWorker(QThread):
                     self.commit_part()
         except Exception as exc:
             self.speed = 0
-            self.status, self.error = ('Waiting for network' if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, socket.timeout)) and not isinstance(exc, urllib.error.HTTPError) else 'Failed'), str(exc)
+            if self.stop_event.is_set():
+                self.status, self.error = self.reason, ''
+                if self.reason == 'Canceled' and self.path:
+                    try: Path(str(self.path) + '.part').unlink(missing_ok=True)
+                    except OSError as cleanup_error: self.status, self.error = 'Failed', str(cleanup_error)
+                self.emit_update()
+                return
+            transient = (isinstance(exc, urllib.error.HTTPError) and exc.code in (408, 429, 500, 502, 503, 504)) or (isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, socket.timeout)) and not isinstance(exc, urllib.error.HTTPError))
+            self.status, self.error = ('Waiting for network' if transient else 'Failed'), str(exc)
         self.emit_update()
 
     def verify_part(self, part):
