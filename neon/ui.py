@@ -1,14 +1,19 @@
 import os
 import re
+import shutil
+import json
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from PySide6.QtCore import Qt, QSettings, QUrl, QTimer
-from PySide6.QtGui import QDesktopServices, QIcon
+from PySide6.QtGui import QDesktopServices, QIcon, QPainter, QPen, QColor, QPainterPath
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QCheckBox, QDialog, QDialogButtonBox, QSystemTrayIcon,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QCheckBox, QDialog, QDialogButtonBox, QSystemTrayIcon, QMenu, QInputDialog,
     QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 from .engine import HttpWorker, TorrentEngine, RateLimiter, readable
+from .history import History
+from .extract import ExtractWorker
 
 ROOT = Path(__file__).resolve().parent.parent
 STYLE = '''
@@ -59,6 +64,26 @@ def button(text, callback, primary=False):
     b.clicked.connect(callback)
     return b
 
+class SpeedGraph(QWidget):
+    def __init__(self):
+        super().__init__(); self.samples = []; self.setMinimumHeight(90); self.setMaximumHeight(110)
+    def add_sample(self, down, up):
+        self.samples = (self.samples + [(down, up)])[-60:]; self.update()
+    def paintEvent(self, event):
+        painter = QPainter(self); painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor('#191520')); painter.setPen(QColor('#9b91a5')); painter.drawText(12, 20, 'TRANSFER SPEED   ↓ RED    ↑ PURPLE')
+        if len(self.samples) < 2: return
+        high = max(max(a,b) for a,b in self.samples) or 1
+        for channel, color in ((0, '#ff527a'), (1, '#b66cff')):
+            path = QPainterPath()
+            for i, point in enumerate(self.samples):
+                x = 12 + i * max(1, self.width()-24) / 59
+                y = self.height()-10 - point[channel] / high * max(1, self.height()-40)
+                if i == 0: path.moveTo(x,y)
+                else: path.lineTo(x,y)
+            painter.setPen(QPen(QColor(color), 2)); painter.drawPath(path)
+
+
 class TransferCard(QFrame):
     def __init__(self, owner, obj, data):
         super().__init__(); self.setObjectName('card'); self.owner, self.obj = owner, obj
@@ -76,8 +101,11 @@ class TransferCard(QFrame):
         self.pause = button('Pause', self.toggle); row.addWidget(self.pause)
         self.cancel = button('Cancel', self.cancel_transfer); row.addWidget(self.cancel)
         self.open = button('Open', self.open_file); row.addWidget(self.open)
-        self.resolve = button('Review hash', self.review_hash); row.addWidget(self.resolve)
-        self.limits_button = button('Limits', self.edit_limits); row.addWidget(self.limits_button); row.addWidget(button('Folder', self.open_folder)); row.addWidget(button('Remove', self.remove)); box.addLayout(row)
+        self.resolve = button('Review hash', self.review_hash); row.addWidget(self.resolve); box.addLayout(row)
+        row = QHBoxLayout(); row.setSpacing(7); row.addStretch()
+        self.priority_button = button('Priority', self.set_priority); row.addWidget(self.priority_button)
+        self.peers_button = button('Peers', self.show_peers); row.addWidget(self.peers_button)
+        self.limits_button = button('Limits', self.edit_limits); row.addWidget(self.limits_button); row.addWidget(button('Folder', self.open_folder)); row.addWidget(button('Remove', self.remove)); row.addWidget(button('Delete', self.delete_file)); box.addLayout(row)
         self.update_data(data)
 
     def update_data(self, d):
@@ -99,6 +127,8 @@ class TransferCard(QFrame):
         self.pause.setText('Resume' if d['status'] in ('Paused', 'Failed') else 'Pause')
         self.resolve.setVisible(d['status'] == 'Checksum mismatch')
         self.limits_button.setEnabled(d['status'] != 'Canceled')
+        self.priority_button.setVisible(not is_torrent); self.priority_button.setEnabled(d['status'] in ('Queued','Paused','Waiting for network'))
+        self.peers_button.setVisible(is_torrent); self.peers_button.setEnabled(d['status'] != 'Canceled')
         self.pause.setEnabled(d['status'] not in ('Completed', 'Canceled', 'Checksum mismatch', 'Verifying') and (torrent or not self.obj.isRunning() or d['status'] in ('Downloading', 'Connecting')))
         self.cancel.setEnabled(d['status'] not in ('Completed', 'Canceled', 'Checksum mismatch') and not (torrent and d['status'] == 'Seeding'))
         self.open.setEnabled(d['status'] in ('Completed', 'Seeding') and os.path.exists(d['path']))
@@ -107,24 +137,38 @@ class TransferCard(QFrame):
         if self.data['kind'] == 'TORRENT':
             self.obj.resume() if self.data['status'] == 'Paused' else self.obj.pause()
         elif self.obj.isRunning(): self.obj.halt('Paused'); self.pause.setEnabled(False)
-        else: self.obj.start()
+        elif self.data['status'] in ('Waiting for network', 'Queued'): self.obj.status = 'Paused'; self.obj.emit_update()
+        else: self.obj.status = 'Queued'; self.obj.emit_update(); self.owner.pump_queue()
 
     def cancel_transfer(self):
         if self.data['kind'] == 'TORRENT':
-            self.owner.torrents.remove(self.obj); self.data['status'] = 'Canceled'; self.data['down'] = self.data['up'] = 0; self.update_data(self.data)
+            self.torrent_info = dict(self.owner.torrents.sources.get(self.obj, {})); self.owner.torrents.remove(self.obj); self.data['status'] = 'Canceled'; self.data['down'] = self.data['up'] = 0; self.update_data(self.data)
             self.owner.refresh_metrics()
         elif self.obj.isRunning(): self.obj.halt('Canceled'); self.cancel.setEnabled(False)
         else:
             if self.obj.path: Path(str(self.obj.path) + '.part').unlink(missing_ok=True)
             self.obj.status = 'Canceled'; self.obj.offset = 0; self.obj.emit_update()
 
+    def set_priority(self):
+        levels = ['Low', 'Normal', 'High']
+        choice, ok = QInputDialog.getItem(self, 'Queue priority', 'Direct download priority:', levels, getattr(self, 'priority', 1), False)
+        if ok:
+            self.priority = levels.index(choice); self.owner.save_history(); self.owner.pump_queue()
+
+    def show_peers(self):
+        try:
+            peers = self.obj.get_peer_info()
+            lines = [f"Peer {i+1}: ↓ {readable(p.down_speed)}/s  ↑ {readable(p.up_speed)}/s" for i,p in enumerate(peers)]
+            QMessageBox.information(self, 'Connected peers', 'Peer addresses and identifiers are hidden. This is a local snapshot.\n\n' + ('\n'.join(lines[:100]) if lines else 'No connected peers.'))
+        except RuntimeError as exc: QMessageBox.warning(self, 'Peers unavailable', str(exc))
+
     def review_hash(self):
         if self.obj.isRunning():
             QTimer.singleShot(100, self.review_hash); return
         dialog = QMessageBox(self)
-        dialog.setWindowTitle('SHA-256 mismatch')
+        dialog.setWindowTitle(f'{self.obj.hash_type.upper()} mismatch')
         dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setText('The downloaded file does not match the expected SHA-256. It may be corrupt or altered.')
+        dialog.setText(f'The downloaded file does not match the expected {self.obj.hash_type.upper()}. It may be corrupt or altered.')
         dialog.setInformativeText(f"Expected: {self.obj.checksum}\nActual: {self.obj.actual_checksum}\n\nDiscard the file or keep it anyway?")
         discard = dialog.addButton('Discard file', QMessageBox.ButtonRole.DestructiveRole)
         keep = dialog.addButton('Keep anyway', QMessageBox.ButtonRole.AcceptRole)
@@ -154,6 +198,28 @@ class TransferCard(QFrame):
     def open_folder(self):
         path = Path(self.data['path']); folder = path if path.is_dir() else path.parent
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+    def delete_file(self):
+        if self.data['kind'] == 'HTTP' and self.obj.isRunning():
+            QMessageBox.information(self, 'Transfer active', 'Pause or cancel the transfer first.'); return
+        target = Path(self.data['path'])
+        if self.data['kind'] == 'TORRENT':
+            info = self.owner.torrents.sources.get(self.obj) or getattr(self, 'torrent_info', None)
+            if not info: QMessageBox.warning(self, 'Delete unavailable', 'The torrent folder is unavailable.'); return
+            target = Path(info['folder'])
+        elif self.data['status'] not in ('Completed',):
+            target = Path(str(self.obj.path) + '.part') if self.obj.path else None
+        if not target or not target.exists():
+            QMessageBox.information(self, 'File unavailable', 'The downloaded file was not found.'); return
+        if QMessageBox.question(self, 'Delete downloaded data', f'Permanently delete {target} and remove this history entry?', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes: return
+        try:
+            if self.data['kind'] == 'TORRENT':
+                if self.obj in self.owner.torrents.handles: self.owner.torrents.remove(self.obj)
+                if target.is_symlink(): raise ValueError('Cannot delete a symbolic-link folder.')
+                shutil.rmtree(target)
+            else: target.unlink()
+            self.owner.remove_card(self)
+        except (OSError, ValueError) as exc: QMessageBox.warning(self, 'Delete failed', str(exc))
+
     def remove(self):
         if self.data['kind'] == 'HTTP' and self.obj.isRunning():
             QMessageBox.information(self, 'Transfer active', 'Pause or cancel this transfer before removing it.'); return
@@ -165,13 +231,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__(); self.setWindowTitle("Z's Download Manager"); self.resize(1200, 820); self.setMinimumSize(850, 600)
         self.setWindowIcon(QIcon(str(ROOT / 'assets/logo.svg'))); self.setStyleSheet(STYLE)
-        self.settings = QSettings('Nexus', 'DownloadManager'); self.cards = []; self.nav_buttons = {}; self.section = 'Dashboard'
+        self.settings = QSettings('Nexus', 'DownloadManager'); self.history = History(); self.restoring = False; self.history_readonly = False; self.cards = []; self.nav_buttons = {}; self.section = 'Dashboard'
         self.directory = self.settings.value('directory', str(Path.home() / 'Downloads'))
         self.torrents = TorrentEngine(); self.torrents.changed.connect(self.torrent_update)
-        self.http_limiter = RateLimiter(); self.last_status = {}; self.clipboard_seen = ''
+        self.http_limiter = RateLimiter(); self.last_status = {}; self.clipboard_seen = ''; self.extract_workers = []
         self.tray = QSystemTrayIcon(QIcon(str(ROOT / 'assets/logo.svg')), self)
         self.notification_path = None
         self.tray.messageClicked.connect(self.open_notification)
+        menu = QMenu(self); menu.addAction('Open dashboard', lambda: self.navigate_and_show()); menu.addAction('Pause all', self.pause_all); menu.addAction('Resume all', self.resume_all); self.tray.setContextMenu(menu)
         if QSystemTrayIcon.isSystemTrayAvailable(): self.tray.show()
         QApplication.clipboard().dataChanged.connect(self.clipboard_changed)
         root = QWidget(); root.setObjectName('canvas'); self.setCentralWidget(root); outer = QHBoxLayout(root); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
@@ -183,19 +250,23 @@ class MainWindow(QMainWindow):
             b = QPushButton(f'{icon}   {section}'); b.setObjectName('nav'); b.setCheckable(True); b.clicked.connect(lambda checked=False, s=section: self.navigate(s)); sl.addWidget(b); self.nav_buttons[section] = b
         sl.addStretch(); sl.addWidget(label('●  ENGINE ONLINE', 'eyebrow')); sl.addWidget(label('Built for the flow.', 'muted')); outer.addWidget(side)
         main = QWidget(); ml = QVBoxLayout(main); ml.setContentsMargins(32,28,32,24); ml.setSpacing(18); outer.addWidget(main,1)
-        header = QHBoxLayout(); titles = QVBoxLayout(); titles.addWidget(label('YOUR TRANSFER SPACE', 'eyebrow')); self.heading = label('Dashboard', 'title'); titles.addWidget(self.heading); header.addLayout(titles); header.addStretch(); header.addWidget(label('●  SYSTEM READY', 'eyebrow')); ml.addLayout(header)
+        header = QHBoxLayout(); titles = QVBoxLayout(); titles.addWidget(label('YOUR TRANSFER SPACE', 'eyebrow')); self.heading = label('Dashboard', 'title'); titles.addWidget(self.heading); header.addLayout(titles); header.addStretch(); header.addWidget(button('Mini mode', self.open_mini)); header.addWidget(label('●  SYSTEM READY', 'eyebrow')); ml.addLayout(header)
         self.content = QWidget(); self.content_layout = QVBoxLayout(self.content); self.content_layout.setContentsMargins(0,0,0,0); self.content_layout.setSpacing(16); ml.addWidget(self.content, 1)
-        self.metrics = QWidget(); metrics_layout = QHBoxLayout(self.metrics); metrics_layout.setContentsMargins(0,0,0,0); metrics_layout.setSpacing(10); self.metric_values = []
+        self.metrics = QWidget(); metrics_layout = QHBoxLayout(self.metrics); metrics_layout.setContentsMargins(0,0,0,0); metrics_layout.setSpacing(10); self.metric_values = []; self.metric_frames = []
         for title in ['DOWNLOAD SPEED','UPLOAD SPEED','ACTIVE TRANSFERS','COMPLETED']:
-            frame = QFrame(); frame.setObjectName('metric'); fl = QVBoxLayout(frame); fl.setContentsMargins(16,14,16,14); fl.addWidget(label(title,'eyebrow')); value = label('0','metricValue'); fl.addWidget(value); self.metric_values.append(value); metrics_layout.addWidget(frame)
+            frame = QFrame(); frame.setObjectName('metric'); fl = QVBoxLayout(frame); fl.setContentsMargins(16,14,16,14); fl.addWidget(label(title,'eyebrow')); value = label('0','metricValue'); fl.addWidget(value); self.metric_values.append(value); self.metric_frames.append(frame); frame.setVisible(self.settings.value('metric_' + title, True, type=bool)); metrics_layout.addWidget(frame)
         self.content_layout.addWidget(self.metrics)
+        self.speed_graph = SpeedGraph(); self.content_layout.addWidget(self.speed_graph)
+        self.graph_timer = QTimer(self); self.graph_timer.timeout.connect(self.sample_speeds); self.graph_timer.start(1000)
         self.add_panel = QFrame(); self.add_panel.setObjectName('panel'); al = QVBoxLayout(self.add_panel); al.setContentsMargins(18,16,18,17)
         row = QHBoxLayout(); row.addWidget(label('Start a transfer', 'filename')); row.addStretch(); row.addWidget(label('HTTP / HTTPS  ·  MAGNET  ·  TORRENT', 'eyebrow')); al.addLayout(row)
         row = QHBoxLayout(); self.url = QLineEdit(); self.url.setPlaceholderText('Paste a download URL or magnet link…'); self.url.returnPressed.connect(self.add_url); row.addWidget(self.url,1); row.addWidget(button('Add transfer  ↗',self.add_url,True)); row.addWidget(button('Open .torrent',self.add_torrent_file)); al.addLayout(row)
-        self.hash_input = QLineEdit(); self.hash_input.setPlaceholderText('Optional SHA-256 for direct downloads (64 hex characters)'); al.addWidget(self.hash_input)
+        hash_row = QHBoxLayout(); self.hash_type = QComboBox(); self.hash_type.addItems(['SHA-256','SHA-512']); hash_row.addWidget(self.hash_type)
+        self.hash_input = QLineEdit(); self.hash_input.setPlaceholderText('Optional expected checksum for direct downloads'); hash_row.addWidget(self.hash_input,1); al.addLayout(hash_row)
         self.destination = label('', 'muted'); al.addWidget(self.destination); self.content_layout.addWidget(self.add_panel)
         filters = QHBoxLayout(); self.search = QLineEdit(); self.search.setPlaceholderText('Search transfers…'); self.search.textChanged.connect(self.filter_cards); filters.addWidget(self.search, 1)
-        self.filter = QComboBox(); self.filter.addItems(['All', 'Active', 'Completed', 'Failed', 'Torrents']); self.filter.currentTextChanged.connect(self.filter_cards); filters.addWidget(self.filter)
+        self.filter = QComboBox(); self.filter.addItems(['All', 'Active', 'Completed', 'Failed', 'Torrents', 'Quarantine']); self.filter.currentTextChanged.connect(self.filter_cards); filters.addWidget(self.filter)
+        self.sort = QComboBox(); self.sort.addItems(['Date', 'Name', 'Size', 'Speed', 'Progress', 'Status']); self.sort.currentTextChanged.connect(self.sort_cards); filters.addWidget(self.sort); filters.addWidget(button('Clear history', self.clear_history))
         self.filter_widget = QWidget(); self.filter_widget.setLayout(filters); filters.setContentsMargins(0,0,0,0); self.content_layout.addWidget(self.filter_widget)
         self.list_label = label('TRANSFER ACTIVITY', 'eyebrow'); self.content_layout.addWidget(self.list_label)
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -206,14 +277,24 @@ class MainWindow(QMainWindow):
         self.global_down = QSpinBox(); self.global_down.setRange(0,1000000); self.global_down.setPrefix('Download: '); self.global_down.setSuffix(' KiB/s'); self.global_down.setValue(int(self.settings.value('down_limit',0))); se.addWidget(self.global_down)
         self.global_up = QSpinBox(); self.global_up.setRange(0,1000000); self.global_up.setPrefix('Upload: '); self.global_up.setSuffix(' KiB/s'); self.global_up.setValue(int(self.settings.value('up_limit',0))); se.addWidget(self.global_up)
         self.global_down.valueChanged.connect(self.update_limits); self.global_up.valueChanged.connect(self.update_limits)
+        se.addWidget(label('Dashboard panels', 'filename'))
+        for idx, title in enumerate(['DOWNLOAD SPEED','UPLOAD SPEED','ACTIVE TRANSFERS','COMPLETED']):
+            check = QCheckBox(title.title()); check.setChecked(self.settings.value('metric_' + title, True, type=bool)); check.toggled.connect(lambda enabled, i=idx, name=title: self.set_metric_visible(i, name, enabled)); se.addWidget(check)
+        self.graph_enabled = QCheckBox('Show speed graph'); self.graph_enabled.setChecked(self.settings.value('show_graph', True, type=bool)); self.graph_enabled.toggled.connect(lambda enabled: self.settings.setValue('show_graph', enabled)); se.addWidget(self.graph_enabled)
+        self.compact = QCheckBox('Compact transfer cards'); self.compact.setChecked(self.settings.value('compact', False, type=bool)); self.compact.toggled.connect(self.set_compact); se.addWidget(self.compact)
+        self.extract_enabled = QCheckBox('Automatically extract completed ZIP archives'); self.extract_enabled.setChecked(self.settings.value('extract_zip', False, type=bool)); self.extract_enabled.toggled.connect(lambda v: self.settings.setValue('extract_zip', v)); se.addWidget(self.extract_enabled)
+        self.organize = QCheckBox('Organize direct downloads into folders by file type'); self.organize.setChecked(self.settings.value('organize', False, type=bool)); self.organize.toggled.connect(lambda v: self.settings.setValue('organize', v)); se.addWidget(self.organize)
+        options = QHBoxLayout(); options.addWidget(button('Export settings', self.export_settings)); options.addWidget(button('Import settings', self.import_settings)); se.addLayout(options)
         self.clipboard_enabled = QCheckBox('Offer to add links copied to the clipboard'); self.clipboard_enabled.setChecked(self.settings.value('clipboard', False, type=bool)); self.clipboard_enabled.toggled.connect(lambda v: self.settings.setValue('clipboard',v)); se.addWidget(self.clipboard_enabled)
-        se.addWidget(label('Notifications appear when your system tray is available. Click a completed notification to open the file.', 'muted')); se.addStretch(); self.content_layout.addWidget(self.settings_panel,1)
-        self.navigate('Dashboard'); self.update_directory(); self.refresh_metrics(); self.update_limits()
+        se.addWidget(label('Notifications appear when your system tray is available. Click a completed notification to open the file.', 'muted')); se.addStretch(); self.settings_scroll = QScrollArea(); self.settings_scroll.setWidgetResizable(True); self.settings_scroll.setWidget(self.settings_panel); self.content_layout.addWidget(self.settings_scroll,1)
+        self.navigate('Dashboard'); self.update_directory(); self.refresh_metrics(); self.update_limits(); self.restore_history()
+        self.save_timer = QTimer(self); self.save_timer.timeout.connect(self.save_history); self.save_timer.start(5000)
+        self.retry_timer = QTimer(self); self.retry_timer.timeout.connect(self.retry_network); self.retry_timer.start(15000)
 
     def navigate(self, section):
         self.section = section; self.heading.setText(section)
         for name,b in self.nav_buttons.items(): b.setChecked(name == section)
-        settings = section == 'Settings'; self.settings_panel.setVisible(settings); self.scroll.setVisible(not settings); self.list_label.setVisible(not settings); self.add_panel.setVisible(not settings); self.filter_widget.setVisible(not settings); self.metrics.setVisible(section == 'Dashboard')
+        settings = section == 'Settings'; self.settings_scroll.setVisible(settings); self.scroll.setVisible(not settings); self.list_label.setVisible(not settings); self.add_panel.setVisible(not settings); self.filter_widget.setVisible(not settings); self.metrics.setVisible(section == 'Dashboard'); self.speed_graph.setVisible(section == 'Dashboard' and self.graph_enabled.isChecked())
         self.filter_cards()
     def filter_cards(self, *args):
         count=0
@@ -221,10 +302,97 @@ class MainWindow(QMainWindow):
             visible = self.section in ('Dashboard', 'Downloads')
             query = self.search.text().strip().lower(); selected = self.filter.currentText(); status = c.data['status']
             visible = visible and (not query or query in c.data['name'].lower() or query in c.data['path'].lower())
-            visible = visible and (selected == 'All' or (selected == 'Active' and status in ('Connecting','Downloading','Fetching metadata','Verifying','Seeding')) or (selected == 'Completed' and status in ('Completed','Seeding')) or (selected == 'Failed' and status in ('Failed','Checksum mismatch')) or (selected == 'Torrents' and c.data['kind'] == 'TORRENT'))
+            visible = visible and (selected == 'All' or (selected == 'Active' and status in ('Connecting','Downloading','Fetching metadata','Verifying','Seeding')) or (selected == 'Completed' and status in ('Completed','Seeding')) or (selected == 'Failed' and status in ('Failed','Checksum mismatch')) or (selected == 'Torrents' and c.data['kind'] == 'TORRENT') or (selected == 'Quarantine' and status == 'Checksum mismatch'))
             c.setVisible(visible); count += bool(visible)
         self.empty.setText('No transfers match your search or filter.' if self.cards else 'No transfers yet. Paste a link above to get started.')
         self.empty.setVisible(count == 0)
+    def set_metric_visible(self, index, name, enabled):
+        self.settings.setValue('metric_' + name, enabled); self.metric_frames[index].setVisible(enabled)
+
+    def set_compact(self, value):
+        self.settings.setValue('compact', value)
+        for card in self.cards: card.detail.setVisible(not value); card.stats.setVisible(not value)
+
+    def sort_cards(self, *args):
+        choice = self.sort.currentText()
+        def key(card):
+            d = card.data
+            return {'Date': lambda: getattr(card, 'created', 0), 'Name': lambda: d['name'].lower(),
+                    'Size': lambda: d['total'], 'Speed': lambda: d['down'],
+                    'Progress': lambda: d['done'] / d['total'] if d['total'] else 0,
+                    'Status': lambda: d['status']}.get(choice, lambda: 0)()
+        ordered = sorted(self.cards, key=key, reverse=choice in ('Date','Size','Speed','Progress'))
+        for i, card in enumerate(ordered): self.list_layout.removeWidget(card); self.list_layout.insertWidget(i, card)
+
+    def clear_history(self):
+        choice, ok = QInputDialog.getItem(self, 'Clear history', 'Remove inactive entries:', ['Completed', 'Failed', 'Canceled', 'Older than 30 days', 'Currently filtered'], 0, False)
+        if not ok: return
+        inactive = ('Completed', 'Failed', 'Canceled', 'Paused', 'Checksum mismatch')
+        def matches(c):
+            if c.data['status'] not in inactive: return False
+            if c.data['kind'] == 'HTTP' and c.obj.isRunning(): return False
+            if choice == 'Older than 30 days': return getattr(c, 'created', time.time()) < time.time() - 30*86400
+            if choice == 'Currently filtered': return not c.isHidden()
+            return c.data['status'] == choice
+        targets = [c for c in self.cards if matches(c)]
+        if not targets: QMessageBox.information(self, 'Clear history', 'No inactive entries match.'); return
+        if QMessageBox.question(self, 'Clear history', f'Remove {len(targets)} history entries? Downloaded and partial files will be kept.') != QMessageBox.StandardButton.Yes: return
+        for c in targets:
+            if c.data['kind'] == 'TORRENT' and c.obj in self.torrents.handles: self.torrents.remove(c.obj)
+            self.remove_card(c)
+
+    def destination_for(self, url):
+        folder = Path(self.directory)
+        if self.organize.isChecked():
+            ext = Path(urlsplit(url).path).suffix.lower()
+            categories = {'.zip':'Archives','.rar':'Archives','.7z':'Archives','.tar':'Archives','.gz':'Archives', '.mp4':'Videos','.mkv':'Videos','.mov':'Videos','.avi':'Videos', '.pdf':'Documents','.docx':'Documents','.txt':'Documents', '.png':'Images','.jpg':'Images','.jpeg':'Images','.webp':'Images'}
+            folder = folder / categories.get(ext, 'Other')
+            folder.mkdir(parents=True, exist_ok=True)
+        return str(folder)
+
+    def export_settings(self):
+        path, _ = QFileDialog.getSaveFileName(self, 'Export settings', 'z-settings.json', 'JSON (*.json)')
+        if not path: return
+        try:
+            values = {'directory': self.directory, 'down_limit': self.global_down.value(), 'up_limit': self.global_up.value(), 'clipboard': self.clipboard_enabled.isChecked(), 'organize': self.organize.isChecked(), 'extract_zip': self.extract_enabled.isChecked(), 'compact': self.compact.isChecked(), 'show_graph': self.graph_enabled.isChecked()}
+            for i, name in enumerate(('DOWNLOAD SPEED','UPLOAD SPEED','ACTIVE TRANSFERS','COMPLETED')): values['metric_' + name] = self.settings.value('metric_' + name, True, type=bool)
+            Path(path).write_text(json.dumps(values, indent=2), encoding='utf-8')
+        except OSError as exc: QMessageBox.warning(self, 'Export failed', str(exc))
+
+    def import_settings(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Import settings', '', 'JSON (*.json)')
+        if not path: return
+        try:
+            values = json.loads(Path(path).read_text(encoding='utf-8'))
+            down = int(values.get('down_limit', 0)); up = int(values.get('up_limit', 0))
+            if not (0 <= down <= 1000000 and 0 <= up <= 1000000): raise ValueError('Invalid speed limit')
+            directory = values.get('directory', self.directory)
+            if not isinstance(directory, str) or not directory: raise ValueError('Invalid directory')
+            def checked(value): return value if isinstance(value, bool) else str(value).lower() in ('true','1')
+            self.directory = directory; self.settings.setValue('directory', directory); self.update_directory()
+            self.global_down.setValue(down); self.global_up.setValue(up)
+            self.clipboard_enabled.setChecked(checked(values.get('clipboard', False))); self.organize.setChecked(checked(values.get('organize', False)))
+            self.extract_enabled.setChecked(checked(values.get('extract_zip', False))); self.compact.setChecked(checked(values.get('compact', False))); self.graph_enabled.setChecked(checked(values.get('show_graph', True)))
+            for name in ('DOWNLOAD SPEED','UPLOAD SPEED','ACTIVE TRANSFERS','COMPLETED'):
+                if 'metric_' + name in values: self.settings.setValue('metric_' + name, checked(values['metric_' + name]))
+            QMessageBox.information(self, 'Settings imported', 'Restart the app to apply all dashboard panel settings.')
+        except (OSError, ValueError, TypeError, AttributeError) as exc: QMessageBox.warning(self, 'Import failed', str(exc))
+
+    def navigate_and_show(self):
+        self.navigate('Dashboard'); self.showNormal(); self.raise_(); self.activateWindow()
+
+    def pause_all(self):
+        for c in self.cards:
+            if c.data['kind'] == 'HTTP' and c.obj.isRunning(): c.obj.halt('Paused')
+            elif c.data['kind'] == 'HTTP' and c.data['status'] in ('Queued','Waiting for network'): c.obj.status = 'Paused'; c.obj.emit_update()
+            elif c.data['kind'] == 'TORRENT' and c.obj in self.torrents.handles: c.obj.pause()
+
+    def resume_all(self):
+        for c in self.cards:
+            if c.data['kind'] == 'HTTP' and c.data['status'] in ('Paused','Waiting for network') and not c.obj.isRunning(): c.obj.status = 'Queued'; c.obj.emit_update()
+            elif c.data['kind'] == 'TORRENT' and c.data['status'] == 'Paused' and c.obj in self.torrents.handles: c.obj.resume()
+        self.pump_queue()
+
     def update_directory(self):
         self.destination.setText('SAVE TO  ·  ' + self.directory); self.path_label.setText(self.directory)
     def choose_folder(self):
@@ -238,19 +406,22 @@ class MainWindow(QMainWindow):
         try:
             self.ensure_directory()
             checksum = self.hash_input.text().strip()
-            if checksum and not re.fullmatch(r'[0-9a-fA-F]{64}', checksum): raise ValueError('SHA-256 must be exactly 64 hexadecimal characters.')
+            algorithm = self.hash_type.currentText().lower().replace('-', '')
+            digits = 64 if algorithm == 'sha256' else 128
+            if checksum and (len(checksum) != digits or not re.fullmatch(r'[0-9a-fA-F]+', checksum)): raise ValueError(f'{algorithm.upper()} must be exactly {digits} hexadecimal characters.')
             if url.startswith('magnet:?'):
-                if checksum: raise ValueError('SHA-256 verification is available for direct downloads only. Torrents use their own piece verification.')
+                if checksum: raise ValueError('Checksums are available for direct downloads only. Torrents use their own piece verification.')
                 self.add_torrent(url)
             else:
                 parsed=urlsplit(url)
                 if parsed.scheme not in ('http','https') or not parsed.hostname: raise ValueError('Enter a valid HTTP, HTTPS, or magnet link.')
-                worker=HttpWorker(url,self.directory,self.http_limiter,checksum); card=TransferCard(self,worker,worker.snapshot()); self.add_card(card); worker.changed.connect(card.update_data); worker.changed.connect(lambda data, c=card: self.transfer_changed(c, data)); worker.start()
+                directory = self.destination_for(url)
+                worker=HttpWorker(url,directory,self.http_limiter,checksum,algorithm); card=TransferCard(self,worker,worker.snapshot()); self.bind_worker(card); self.add_card(card); self.pump_queue(); self.save_history()
             self.url.clear(); self.hash_input.clear()
         except Exception as e: QMessageBox.warning(self,'Could not start transfer',str(e))
     def add_torrent_file(self):
         if self.hash_input.text().strip():
-            QMessageBox.information(self, 'SHA-256 verification', 'The SHA-256 field applies to direct downloads. Clear it before adding a torrent; torrents verify their pieces automatically.'); return
+            QMessageBox.information(self, 'SHA-256 verification', 'The checksum field applies to direct downloads. Clear it before adding a torrent; torrents verify their pieces automatically.'); return
         path,_=QFileDialog.getOpenFileName(self,'Open torrent file','','Torrent files (*.torrent)')
         if path:
             try: self.ensure_directory(); self.add_torrent(path)
@@ -258,16 +429,110 @@ class MainWindow(QMainWindow):
     def add_torrent(self, source):
         h=self.torrents.add(source,self.directory)
         d=dict(name='Fetching metadata…',kind='TORRENT',status='Fetching metadata',done=0,total=0,down=0,up=0,uploaded=0,path=self.directory,error='')
-        self.add_card(TransferCard(self,h,d)); self.torrents.poll()
+        self.add_card(TransferCard(self,h,d)); self.torrents.poll(); self.save_history()
     def torrent_update(self,h,data):
         for c in self.cards:
             if c.data['kind']=='TORRENT' and c.obj==h: c.update_data(data); self.transfer_changed(c, data); break
         self.refresh_metrics()
-    def add_card(self,c): self.cards.append(c); self.list_layout.insertWidget(self.list_layout.count()-1,c); self.filter_cards(); self.refresh_metrics(); self.update_limits()
-    def remove_card(self,c): self.last_status.pop(c, None); self.cards.remove(c); self.list_layout.removeWidget(c); c.deleteLater(); self.filter_cards(); self.refresh_metrics(); self.update_limits()
+    def add_card(self,c): c.created = getattr(c, 'created', time.time()); self.cards.append(c); c.detail.setVisible(not self.compact.isChecked()); c.stats.setVisible(not self.compact.isChecked()); self.list_layout.insertWidget(self.list_layout.count()-1,c); self.filter_cards(); self.sort_cards(); self.refresh_metrics(); self.update_limits()
+    def remove_card(self,c): self.last_status.pop(c, None); self.cards.remove(c); self.list_layout.removeWidget(c); c.deleteLater(); self.filter_cards(); self.refresh_metrics(); self.update_limits(); self.save_history()
     def refresh_metrics(self,*args):
         ds=[c.data for c in self.cards]; values=[readable(sum(x['down'] for x in ds))+'/s',readable(sum(x['up'] for x in ds))+'/s',str(sum(x['status'] in ('Downloading','Connecting','Fetching metadata','Seeding') for x in ds)),str(sum(x['status'] in ('Completed','Seeding') for x in ds))]
         for w,v in zip(self.metric_values,values): w.setText(v)
+    def pump_queue(self):
+        # Direct downloads have three slots; higher priority queued items start first.
+        active = sum(c.obj.isRunning() for c in self.cards if c.data['kind'] == 'HTTP')
+        queued = [c for c in self.cards if c.data['kind'] == 'HTTP' and c.obj.status == 'Queued' and not c.obj.isRunning()]
+        queued.sort(key=lambda c: (-getattr(c, 'priority', 1), getattr(c, 'created', 0)))
+        for card in queued[:max(0, 3-active)]: card.obj.start()
+
+    def bind_worker(self, card):
+        card.obj.changed.connect(card.update_data)
+        card.obj.changed.connect(lambda data, c=card: self.transfer_changed(c, data))
+        card.obj.finished.connect(self.pump_queue)
+
+    def history_records(self):
+        records = []
+        for card in self.cards:
+            data = dict(card.data); obj = card.obj
+            data.update(created=getattr(card, 'created', time.time()), priority=getattr(card, 'priority', 1))
+            if data['kind'] == 'HTTP':
+                data.update(url=obj.url, directory=obj.directory, validator=obj.validator, checksum=obj.checksum, hash_type=obj.hash_type, actual_checksum=obj.actual_checksum, local_limit=obj.local_limiter.rate, worker_path=str(obj.path) if obj.path else '')
+            else:
+                info = self.torrents.sources.get(obj) or getattr(card, 'torrent_info', None)
+                if not info: continue
+                data.update(info)
+            records.append(data)
+        return records
+
+    def save_history(self):
+        if self.restoring or self.history_readonly: return
+        try: self.history.save(self.history_records())
+        except OSError as exc:
+            if not getattr(self, '_history_error_shown', False):
+                self._history_error_shown = True; QMessageBox.warning(self, 'History could not be saved', str(exc))
+
+    def restore_history(self):
+        self.restoring = True; restart = []; errors = []
+        try:
+            try: records = self.history.load()
+            except (OSError, ValueError) as exc:
+                self.history_readonly = True; QMessageBox.warning(self, 'History could not be loaded', str(exc)); return
+            for data in records:
+                try:
+                    if data['kind'] == 'HTTP':
+                        obj = HttpWorker(data['url'], data['directory'], self.http_limiter, data.get('checksum',''), data.get('hash_type','sha256'))
+                        obj.path = Path(data['worker_path']) if data.get('worker_path') else None
+                        obj.validator = data.get('validator'); obj.total = data.get('total', 0); obj.offset = data.get('done', 0)
+                        obj.actual_checksum = data.get('actual_checksum', ''); obj.status = data['status']; obj.error = data.get('error','')
+                        obj.local_limiter.set_rate(data.get('local_limit',0))
+                        if obj.status in ('Queued','Downloading','Connecting','Verifying','Waiting for network'):
+                            obj.status = 'Queued'; restart.append(obj)
+                        data.update(obj.snapshot())
+                        card = TransferCard(self, obj, data); self.bind_worker(card)
+                    else:
+                        if data['status'] == 'Canceled':
+                            obj = object()
+                            card = TransferCard(self, obj, data)
+                            card.torrent_info = {key: data.get(key) for key in ('source', 'blob', 'folder')}
+                        else:
+                            obj = self.torrents.add(data['source'], str(Path(data['folder']).parent), restore_folder=data['folder'], saved_blob=data.get('blob'))
+                            if data['status'] == 'Paused': obj.pause()
+                            card = TransferCard(self, obj, data)
+                    card.created = data.get('created', time.time()); card.priority = data.get('priority', 1); self.add_card(card)
+                except (ValueError, OSError, KeyError, RuntimeError) as exc: errors.append(str(exc))
+            self.pump_queue()
+            self.torrents.poll()
+            if errors:
+                self.history_readonly = True
+                QMessageBox.warning(self, 'Some transfers could not be restored', 'History will not be overwritten.\n' + '\n'.join(errors[:5]))
+        finally: self.restoring = False
+
+    def retry_network(self):
+        for card in self.cards:
+            if card.data['kind'] == 'HTTP' and card.data['status'] == 'Waiting for network' and not card.obj.isRunning(): card.obj.status = 'Queued'; card.obj.emit_update()
+        self.pump_queue()
+
+    def open_mini(self):
+        if getattr(self, 'mini', None) and self.mini.isVisible():
+            self.mini.raise_(); return
+        dialog = QDialog(self, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        dialog.setWindowTitle("Z's Downloads"); dialog.setMinimumWidth(300)
+        layout = QVBoxLayout(dialog); layout.addWidget(label("Z'S DOWNLOAD MANAGER", 'eyebrow'))
+        summary = label('', 'filename'); layout.addWidget(summary)
+        speeds = label('', 'muted'); layout.addWidget(speeds)
+        layout.addWidget(button('Open dashboard', lambda: (dialog.hide(), self.navigate_and_show())))
+        timer = QTimer(dialog)
+        def refresh():
+            items = [c.data for c in self.cards]
+            summary.setText(f"{sum(d['status'] in ('Connecting','Downloading','Fetching metadata','Seeding') for d in items)} active transfers")
+            speeds.setText(f"↓ {readable(sum(d['down'] for d in items))}/s    ↑ {readable(sum(d['up'] for d in items))}/s")
+        timer.timeout.connect(refresh); timer.start(1000); refresh()
+        self.mini = dialog; dialog.show()
+
+    def sample_speeds(self):
+        self.speed_graph.add_sample(sum(c.data['down'] for c in self.cards), sum(c.data['up'] for c in self.cards))
+
     def update_limits(self, *args):
         down = self.global_down.value() * 1024; up = self.global_up.value() * 1024
         self.settings.setValue('down_limit', self.global_down.value()); self.settings.setValue('up_limit', self.global_up.value())
@@ -284,10 +549,23 @@ class MainWindow(QMainWindow):
         if old != new:
             self.filter_cards(); self.update_limits()
             if new == 'Checksum mismatch': QTimer.singleShot(0, card.review_hash)
+            if new == 'Completed' and data['kind'] == 'HTTP' and not data.get('error') and self.extract_enabled.isChecked() and data['path'].lower().endswith('.zip'):
+                self.extract_zip(data['path'])
             if new in ('Completed', 'Seeding', 'Failed') and old not in ('Completed', 'Seeding', 'Failed'):
                 self.notification_path = data['path'] if new in ('Completed', 'Seeding') else None
                 if self.tray.isVisible(): self.tray.showMessage("Z's Download Manager", f"{data['name']}: {new}." + (' Click to open.' if self.notification_path else ''), QSystemTrayIcon.MessageIcon.Information, 10000)
         self.refresh_metrics()
+        if old != new: self.save_history()
+
+    def extract_zip(self, path):
+        worker = ExtractWorker(path); self.extract_workers.append(worker)
+        def finished(folder, error):
+            message = f'ZIP extracted to {folder}' if folder else f'ZIP extraction failed: {error}'
+            if self.tray.isVisible(): self.tray.showMessage("Z's Download Manager", message, QSystemTrayIcon.MessageIcon.Information, 10000)
+            elif error: QMessageBox.warning(self, 'Extraction failed', message)
+        worker.result.connect(finished)
+        worker.finished.connect(lambda: self.extract_workers.remove(worker) if worker in self.extract_workers else None)
+        worker.start()
 
     def open_notification(self):
         if self.notification_path and os.path.exists(self.notification_path): QDesktopServices.openUrl(QUrl.fromLocalFile(self.notification_path))
@@ -305,6 +583,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self,event):
         workers=[c.obj for c in self.cards if c.data['kind']=='HTTP' and c.obj.isRunning()]
+        resume_on_start = [w for w in workers if not w.stop_event.is_set()]
         for w in workers: w.halt('Paused')
         for w in workers: w.wait(17000)
+        for w in self.extract_workers[:]: w.wait()
+        for c in self.cards:
+            if c.data['kind'] == 'HTTP':
+                if c.obj in resume_on_start and c.obj.status == 'Paused': c.obj.status = 'Queued'
+                c.data = c.obj.snapshot()
+        self.save_history()
         event.accept()

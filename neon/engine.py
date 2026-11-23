@@ -1,8 +1,10 @@
 """Transfer engines. Workers never touch widgets; updates cross Qt signals."""
 import os
 import hashlib
+import base64
 import re
 import threading
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -62,12 +64,13 @@ class RateLimiter:
 
 class HttpWorker(QThread):
     changed = Signal(object)
-    def __init__(self, url, directory, limiter=None, checksum=""):
+    def __init__(self, url, directory, limiter=None, checksum="", hash_type="sha256"):
         super().__init__()
         self.url, self.directory = url, directory
         self.limiter = limiter or RateLimiter()
         self.local_limiter = RateLimiter()
         self.checksum = checksum.lower()
+        self.hash_type = hash_type
         self.actual_checksum = ""
         self.stop_event = threading.Event()
         self.reason = 'Paused'
@@ -150,7 +153,7 @@ class HttpWorker(QThread):
                 if self.checksum:
                     self.status = 'Verifying'
                     self.emit_update()
-                    digest = hashlib.sha256()
+                    digest = hashlib.new(self.hash_type)
                     with open(part, 'rb') as source:
                         for block in iter(lambda: source.read(1024 * 1024), b''):
                             if self.stop_event.is_set(): break
@@ -162,14 +165,14 @@ class HttpWorker(QThread):
                         self.actual_checksum = digest.hexdigest()
                         if self.actual_checksum != self.checksum:
                             self.status = 'Checksum mismatch'
-                            self.error = 'SHA-256 mismatch; file is quarantined pending your decision.'
+                            self.error = f'{self.hash_type.upper()} mismatch; file is quarantined pending your decision.'
                         else:
                             self.commit_part()
                 else:
                     self.commit_part()
         except Exception as exc:
             self.speed = 0
-            self.status, self.error = 'Failed', str(exc)
+            self.status, self.error = ('Waiting for network' if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, socket.timeout)) and not isinstance(exc, urllib.error.HTTPError) else 'Failed'), str(exc)
         self.emit_update()
 
     def commit_part(self):
@@ -203,20 +206,24 @@ class TorrentEngine(QObject):
         super().__init__()
         self.session = lt.session({'listen_interfaces': '0.0.0.0:6881'}) if lt else None
         self.handles = []
+        self.sources = {}
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
         self.timer.start(700)
 
-    def add(self, source, directory):
+    def add(self, source, directory, restore_folder=None, saved_blob=None):
         if not self.session: raise RuntimeError('libtorrent is not installed. Install it to enable torrents.')
         if source.startswith('magnet:'):
             params = lt.parse_magnet_uri(source)
+            blob = None
         else:
+            blob = saved_blob or base64.b64encode(Path(source).read_bytes()).decode('ascii')
             params = lt.add_torrent_params()
-            params.ti = lt.torrent_info(source)
+            params.ti = lt.torrent_info(lt.bdecode(base64.b64decode(blob)))
         # Isolate each torrent so it can never overwrite an existing destination file.
-        folder = unique_path(directory, 'Torrent transfer')
-        folder.mkdir()
+        folder = Path(restore_folder) if restore_folder else unique_path(directory, 'Torrent transfer')
+        if restore_folder and not folder.is_dir(): raise ValueError('Torrent destination folder is missing')
+        if not restore_folder: folder.mkdir()
         params.save_path = str(folder)
         # Refuse an already-added info hash rather than silently sharing a handle.
         try:
@@ -224,9 +231,10 @@ class TorrentEngine(QObject):
             if any(existing == h for existing in self.handles):
                 raise ValueError('This torrent is already in the list')
         except Exception:
-            folder.rmdir()
+            if not restore_folder: folder.rmdir()
             raise
         self.handles.append(h)
+        self.sources[h] = {'source': source, 'blob': blob, 'folder': str(folder)}
         self.poll()
         return h
 
@@ -247,3 +255,4 @@ class TorrentEngine(QObject):
     def remove(self, h):
         self.session.remove_torrent(h)  # preserve files
         self.handles.remove(h)
+        self.sources.pop(h, None)

@@ -19,6 +19,8 @@ with tempfile.TemporaryDirectory() as directory:
     url = f'http://127.0.0.1:{server.server_port}/file.bin'
     correct = HttpWorker(url, str(dest), checksum=hashlib.sha256(payload).hexdigest())
     correct.start(); assert correct.wait(10000); assert correct.status == 'Completed'; assert correct.path.read_bytes() == payload
+    strong = HttpWorker(url, str(dest), checksum=hashlib.sha512(payload).hexdigest(), hash_type='sha512')
+    strong.start(); assert strong.wait(10000); assert strong.status == 'Completed'; assert strong.path.read_bytes() == payload
     wrong = HttpWorker(url, str(dest), checksum='0' * 64)
     wrong.start(); assert wrong.wait(10000); assert wrong.status == 'Checksum mismatch'; assert not wrong.path.exists(); assert Path(str(wrong.path) + '.part').exists()
     wrong.resolve_mismatch(False); assert wrong.status == 'Canceled'; assert not Path(str(wrong.path) + '.part').exists()
